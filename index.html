@@ -1,0 +1,515 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>3D Drone Electronics Explorer</title>
+<style>
+  :root { --bg:#0e141b; --panel:#161e27; --line:#2a3644; --text:#e8edf2; --muted:#97a6b6; --accent:#4d8dff; }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg); color: var(--text);
+    display: grid; grid-template-columns: 1fr 340px;
+  }
+  #view { position: relative; min-height: 0; min-width: 0; overflow: hidden; touch-action: none; }
+  #cv { position: absolute; left: 0; top: 0; width: 100%; height: 100%; display: block; cursor: grab; }
+  .hint { position: absolute; left: 12px; bottom: 10px; font-size: .8rem; color: var(--muted); pointer-events: none; }
+  aside { background: var(--panel); border-left: 1px solid var(--line); padding: 16px; overflow-y: auto; }
+  h1 { font-size: 1.15rem; margin: 0 0 4px; }
+  .sub { margin: 0 0 14px; color: var(--muted); font-size: .9rem; }
+  .list { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 14px; }
+  .list button {
+    font: inherit; font-size: .85rem; padding: 6px 10px; border-radius: 999px;
+    border: 1px solid var(--line); background: transparent; color: var(--text); cursor: pointer;
+  }
+  button[aria-pressed="true"] { background: var(--accent) !important; border-color: var(--accent) !important; color: #fff !important; }
+  button:focus-visible, input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .card { border: 1px solid var(--line); border-radius: 10px; padding: 12px; margin-bottom: 14px; min-height: 130px; }
+  .card h2 { font-size: 1rem; margin: 0 0 6px; }
+  .card p { margin: 0 0 8px; font-size: .9rem; line-height: 1.5; }
+  .card .tag { color: var(--muted); font-size: .85rem; }
+  .controls { display: grid; gap: 10px; margin-bottom: 14px; }
+  .controls label { font-size: .9rem; display: grid; gap: 4px; }
+  .controls .row { display: flex; gap: 8px; }
+  .controls .row button {
+    flex: 1; font: inherit; font-size: .85rem; padding: 8px; border-radius: 8px;
+    border: 1px solid var(--line); background: transparent; color: var(--text); cursor: pointer;
+  }
+  .flow { font-size: .85rem; color: var(--muted); line-height: 1.6; }
+  .flow b { color: var(--text); font-weight: 600; }
+  @media (max-width: 760px) {
+    body { grid-template-columns: 1fr; grid-template-rows: 55vh 1fr; }
+    aside { border-left: 0; border-top: 1px solid var(--line); }
+  }
+</style>
+</head>
+<body>
+
+<div id="view">
+  <canvas id="cv"></canvas>
+  <div class="hint">Drag to rotate · Scroll or pinch to zoom · Click a part</div>
+</div>
+
+<aside>
+  <h1>3D Drone Electronics Explorer</h1>
+  <p class="sub">Pick a part to see what it does.</p>
+  <div class="list" id="list"></div>
+  <div class="card" id="info">
+    <h2>Nothing selected</h2>
+    <p>Choose a part from the list or click it on the drone.</p>
+  </div>
+  <div class="controls">
+    <label>Exploded view
+      <input type="range" id="explode" min="0" max="100" value="0">
+    </label>
+    <div class="row">
+      <button id="spinBtn" aria-pressed="true">Propellers: on</button>
+      <button id="rotBtn" aria-pressed="true">Auto-rotate: on</button>
+    </div>
+  </div>
+  <div class="flow">
+    <b>Power:</b> Battery → ESCs → Motors<br>
+    <b>Control:</b> Receiver → Flight controller → ESCs<br>
+    <b>Sensors:</b> GPS + built-in gyro → Flight controller
+  </div>
+</aside>
+
+<script>
+// No libraries needed: this is a tiny 3D engine drawn on a 2D canvas.
+(function () {
+  const wrap = document.getElementById("view");
+  const cv = document.getElementById("cv");
+  const ctx = cv.getContext("2d");
+
+  // ---------- tiny 3D helpers ----------
+  const sub = (a, b) => [a[0]-b[0], a[1]-b[1], a[2]-b[2]];
+  const add = (a, b) => [a[0]+b[0], a[1]+b[1], a[2]+b[2]];
+  const mul = (a, s) => [a[0]*s, a[1]*s, a[2]*s];
+  const dot = (a, b) => a[0]*b[0] + a[1]*b[1] + a[2]*b[2];
+  const cross = (a, b) => [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]];
+  const len = a => Math.hypot(a[0], a[1], a[2]);
+  const norm = a => { const l = len(a) || 1; return [a[0]/l, a[1]/l, a[2]/l]; };
+  const hex = h => [(h >> 16) & 255, (h >> 8) & 255, h & 255];
+
+  // rotate a point: X first, then Z, then Y (same idea as three.js)
+  function rot(p, r) {
+    let x = p[0], y = p[1], z = p[2], c, s, t;
+    if (r[0]) { c = Math.cos(r[0]); s = Math.sin(r[0]); t = y*c - z*s; z = y*s + z*c; y = t; }
+    if (r[2]) { c = Math.cos(r[2]); s = Math.sin(r[2]); t = x*c - y*s; y = x*s + y*c; x = t; }
+    if (r[1]) { c = Math.cos(r[1]); s = Math.sin(r[1]); t = x*c + z*s; z = -x*s + z*c; x = t; }
+    return [x, y, z];
+  }
+
+  // ---------- geometry: everything becomes flat faces ----------
+  const faces = [];
+  let curPart = "";
+
+  function push(v, color, o) {
+    faces.push({
+      v: v.map(p => add(rot(p, o.rot || [0,0,0]), o.pos || [0,0,0])),
+      color: hex(color), part: curPart,
+      alpha: o.alpha || 1, glow: !!o.glow, spin: o.spin || null
+    });
+  }
+
+  // box, with big faces cut into small tiles so depth sorting looks right
+  function box(w, h, d, color, o) {
+    o = o || {};
+    const x = w/2, y = h/2, z = d/2;
+    const c = [[-x,-y,-z],[x,-y,-z],[x,y,-z],[-x,y,-z],[-x,-y,z],[x,-y,z],[x,y,z],[-x,y,z]];
+    const quads = [[0,1,2,3],[5,4,7,6],[4,0,3,7],[1,5,6,2],[3,2,6,7],[4,5,1,0]];
+    quads.forEach(q => {
+      const p0 = c[q[0]], u = sub(c[q[1]], p0), v = sub(c[q[3]], p0);
+      const nu = Math.max(1, Math.ceil(len(u) / 0.4)), nv = Math.max(1, Math.ceil(len(v) / 0.4));
+      for (let i = 0; i < nu; i++) for (let j = 0; j < nv; j++) {
+        const a = add(p0, add(mul(u, i/nu), mul(v, j/nv)));
+        const b = add(a, mul(u, 1/nu));
+        const cc = add(b, mul(v, 1/nv));
+        const dd = add(a, mul(v, 1/nv));
+        push([a, b, cc, dd], color, o);
+      }
+    });
+  }
+
+  function cyl(r, h, color, o, seg) {
+    o = o || {}; seg = seg || 16;
+    const top = [], bot = [];
+    for (let i = 0; i < seg; i++) {
+      const a = (i / seg) * Math.PI * 2;
+      top.push([Math.cos(a)*r,  h/2, Math.sin(a)*r]);
+      bot.push([Math.cos(a)*r, -h/2, Math.sin(a)*r]);
+    }
+    for (let i = 0; i < seg; i++) {
+      const j = (i + 1) % seg;
+      push([bot[i], bot[j], top[j], top[i]], color, o);
+    }
+    push(top, color, o);
+    push(bot.slice().reverse(), color, o);
+  }
+
+  function sphere(r, color, o) {
+    o = o || {};
+    const lat = 5, lon = 8, pt = (i, j) => {
+      const a = (i / lat) * Math.PI, b = (j / lon) * Math.PI * 2;
+      return [r*Math.sin(a)*Math.cos(b), r*Math.cos(a), r*Math.sin(a)*Math.sin(b)];
+    };
+    for (let i = 0; i < lat; i++) for (let j = 0; j < lon; j++)
+      push([pt(i,j), pt(i+1,j), pt(i+1,j+1), pt(i,j+1)], color, o);
+  }
+
+  // ---------- the drone ----------
+  const parts = {};
+  const spinners = [];
+  const corners = [[1,1],[-1,1],[1,-1],[-1,-1]];
+  const M = 1.2;
+
+  function part(id, name, explode, text, tag, build) {
+    curPart = id;
+    build();
+    parts[id] = { id, name, explode, text, tag };
+  }
+
+  part("frame", "Frame", [0,0,0],
+    "The skeleton. Carbon fibre is strong, light and does not block motor magnetism. Everything else is bolted to it.",
+    "Holds: every other part", () => {
+      const carbon = 0x3a4048;
+      box(1.2, 0.05, 1.1, carbon);
+      box(3.4, 0.08, 0.2, carbon, { rot: [0, -Math.PI/4, 0] });
+      box(3.4, 0.08, 0.2, carbon, { rot: [0,  Math.PI/4, 0] });
+      corners.forEach(c => {
+        cyl(0.03, 0.6, carbon, { pos: [c[0]*0.55, -0.22, c[1]*0.55] }, 8);
+        cyl(0.06, 0.03, carbon, { pos: [c[0]*0.55, -0.52, c[1]*0.55] }, 12);
+      });
+    });
+
+  part("motors", "Brushless motors (x4)", [0,1.0,0],
+    "Turn electricity into spinning force. Each motor has 3 wires. Diagonal motors spin the same direction so the drone does not twist.",
+    "Gets power from: ESC", () => {
+      corners.forEach(c => {
+        const p = [c[0]*M, 0.15, c[1]*M];
+        cyl(0.22, 0.22, 0x7b8594, { pos: p });
+        cyl(0.2, 0.06, 0xc0392b, { pos: [p[0], p[1]+0.14, p[2]] });
+        cyl(0.03, 0.12, 0xdddddd, { pos: [p[0], p[1]+0.22, p[2]] }, 8);
+      });
+    });
+
+  part("props", "Propellers (x4)", [0,2.0,0],
+    "Push air down so the drone goes up. Two spin clockwise and two counter-clockwise. Changing the speed of each motor tilts and steers the drone.",
+    "Turned by: motors", () => {
+      corners.forEach(c => {
+        const sp = { cx: c[0]*M, cz: c[1]*M, dir: (c[0]*c[1] > 0) ? 1 : -1 };
+        spinners.push(sp);
+        box(1.7, 0.015, 0.15, 0xe1e6ec, { pos: [c[0]*M, 0.4, c[1]*M], rot: [0.12, 0, 0], alpha: 0.92, spin: sp });
+        cyl(0.06, 0.05, 0x222222, { pos: [c[0]*M, 0.4, c[1]*M] }, 12);
+      });
+    });
+
+  part("esc", "ESCs (x4)", [0,0.5,0],
+    "Electronic Speed Controllers. They take the battery's DC power and turn it into the 3-phase pulses a brushless motor needs. The flight controller tells each ESC how fast to go.",
+    "Connects: battery → ESC → motor", () => {
+      corners.forEach(c => {
+        const a = Math.atan2(-c[1], c[0]);
+        box(0.32, 0.05, 0.16, 0x1b1f27, { pos: [c[0]*0.6, 0.075, c[1]*0.6], rot: [0, a, 0] });
+        box(0.08, 0.03, 0.08, 0xb8860b, { pos: [c[0]*0.6, 0.115, c[1]*0.6], rot: [0, a, 0] });
+      });
+    });
+
+  part("fc", "Flight controller", [0,0.9,0],
+    "The brain. A microcontroller reads the gyro and accelerometer hundreds of times per second, compares them with your stick commands, and adjusts every motor to keep the drone level.",
+    "Talks to: receiver, GPS, ESCs", () => {
+      const y = 0.13;
+      box(0.7, 0.04, 0.7, 0x1f8f4a, { pos: [0, y, 0] });
+      box(0.2, 0.04, 0.2, 0x111111, { pos: [0.05, y+0.04, 0] });
+      box(0.1, 0.03, 0.1, 0x222222, { pos: [-0.2, y+0.035, 0.15] });
+      for (let i = 0; i < 6; i++) box(0.04, 0.02, 0.04, 0xd4af37, { pos: [-0.28 + i*0.11, y+0.03, -0.3] });
+      [[-1,-1],[1,-1],[-1,1],[1,1]].forEach(c => cyl(0.025, 0.1, 0xcccccc, { pos: [c[0]*0.3, y-0.06, c[1]*0.3] }, 8));
+    });
+
+  part("battery", "LiPo battery", [0,-1.0,0],
+    "Stores the energy. A 4S pack has 4 cells in series (about 14.8 V). More mAh means longer flight, but also more weight.",
+    "Powers: ESCs and flight controller", () => {
+      const y = -0.2;
+      box(0.9, 0.28, 0.45, 0x2c6bd6, { pos: [0, y, 0] });
+      box(0.12, 0.3, 0.47, 0x111111, { pos: [0.2, y, 0] });
+      box(0.12, 0.3, 0.47, 0x111111, { pos: [-0.2, y, 0] });
+      box(0.1, 0.1, 0.16, 0xe6b800, { pos: [0.5, y, 0] });
+    });
+
+  part("gps", "GPS + compass", [0,1.5,0],
+    "Listens to satellites to find where the drone is. Lets it hold position, fly to waypoints and return home. The compass gives the heading.",
+    "Talks to: flight controller", () => {
+      cyl(0.015, 0.4, 0x111111, { pos: [0, 0.4, -0.25] }, 8);
+      cyl(0.2, 0.05, 0xe8e8e8, { pos: [0, 0.6, -0.25] }, 20);
+      cyl(0.14, 0.02, 0x1c3f8f, { pos: [0, 0.635, -0.25] }, 20);
+    });
+
+  part("rx", "Radio receiver", [0.4,1.1,-0.7],
+    "Picks up the signal from your remote controller (usually 2.4 GHz) and passes your stick movements to the flight controller.",
+    "Sends to: flight controller", () => {
+      box(0.25, 0.05, 0.16, 0x7b3fc4, { pos: [0.25, 0.1, -0.42] });
+      cyl(0.01, 0.55, 0x111111, { pos: [0.31, 0.38, -0.47], rot: [0, 0, -0.35] }, 6);
+      cyl(0.01, 0.55, 0x111111, { pos: [0.19, 0.38, -0.47], rot: [0, 0, 0.35] }, 6);
+    });
+
+  part("cam", "Camera", [0,-0.3,1.2],
+    "Sends live video to your goggles or phone through a small video transmitter. Also used to record footage.",
+    "Powered by: flight controller board", () => {
+      box(0.32, 0.3, 0.28, 0x4a525e, { pos: [0, -0.02, 0.62] });
+      cyl(0.1, 0.1, 0x0a0a0a, { pos: [0, -0.02, 0.81], rot: [Math.PI/2, 0, 0] }, 16);
+      cyl(0.07, 0.02, 0x3a6dff, { pos: [0, -0.02, 0.87], rot: [Math.PI/2, 0, 0], glow: true }, 16);
+    });
+
+  part("led", "LED lights", [0,0.3,0],
+    "Green at the front and red at the back so you can tell which way the drone is facing in the air. They can also flash to show battery or GPS status.",
+    "Controlled by: flight controller", () => {
+      corners.forEach(c => {
+        sphere(0.06, c[1] > 0 ? 0x2bea8c : 0xff4d4d, { pos: [c[0]*0.92, 0.09, c[1]*0.92], glow: true });
+      });
+    });
+
+  // ---------- UI: list + info ----------
+  const listEl = document.getElementById("list");
+  const infoEl = document.getElementById("info");
+  let selected = null;
+
+  Object.values(parts).forEach(p => {
+    const b = document.createElement("button");
+    b.textContent = p.name;
+    b.setAttribute("aria-pressed", "false");
+    b.addEventListener("click", () => select(selected === p.id ? null : p.id));
+    p.button = b;
+    listEl.appendChild(b);
+  });
+
+  function select(id) {
+    selected = id;
+    Object.values(parts).forEach(p => p.button.setAttribute("aria-pressed", p.id === id ? "true" : "false"));
+    if (!id) {
+      infoEl.innerHTML = "<h2>Nothing selected</h2><p>Choose a part from the list or click it on the drone.</p>";
+    } else {
+      const p = parts[id];
+      infoEl.innerHTML = "<h2></h2><p></p><span class='tag'></span>";
+      infoEl.querySelector("h2").textContent = p.name;
+      infoEl.querySelector("p").textContent = p.text;
+      infoEl.querySelector(".tag").textContent = p.tag;
+    }
+  }
+
+  // ---------- camera controls ----------
+  let theta = 0.8, phi = 1.15, radius = 8;
+  const target = [0, 0.25, 0];
+  let autoRotate = true, spin = true, spinAngle = 0;
+  let explodeTarget = 0, explodeNow = 0;
+
+  const spinBtn = document.getElementById("spinBtn");
+  const rotBtn = document.getElementById("rotBtn");
+  function setToggle(btn, on, label) {
+    btn.setAttribute("aria-pressed", on ? "true" : "false");
+    btn.textContent = label + ": " + (on ? "on" : "off");
+  }
+  spinBtn.addEventListener("click", () => { spin = !spin; setToggle(spinBtn, spin, "Propellers"); });
+  rotBtn.addEventListener("click", () => { autoRotate = !autoRotate; setToggle(rotBtn, autoRotate, "Auto-rotate"); });
+  document.getElementById("explode").addEventListener("input", e => { explodeTarget = e.target.value / 100; });
+
+  const pointers = new Map();
+  let moved = 0, pinchDist = 0;
+
+  cv.addEventListener("pointerdown", e => {
+    cv.setPointerCapture(e.pointerId);
+    pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    if (pointers.size === 1) moved = 0;
+    if (pointers.size === 2) {
+      const [a, b] = [...pointers.values()];
+      pinchDist = Math.hypot(a.x - b.x, a.y - b.y);
+    }
+  });
+  cv.addEventListener("pointermove", e => {
+    if (!pointers.has(e.pointerId)) return;
+    const prev = pointers.get(e.pointerId);
+    const dx = e.clientX - prev.x, dy = e.clientY - prev.y;
+    pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    moved += Math.abs(dx) + Math.abs(dy);
+    if (moved > 6 && autoRotate) { autoRotate = false; setToggle(rotBtn, false, "Auto-rotate"); }
+    if (pointers.size === 1) {
+      theta -= dx * 0.008;
+      phi = Math.max(0.25, Math.min(Math.PI - 0.25, phi - dy * 0.008));
+    } else if (pointers.size === 2) {
+      const [a, b] = [...pointers.values()];
+      const d = Math.hypot(a.x - b.x, a.y - b.y);
+      radius = Math.max(3.5, Math.min(18, radius * pinchDist / d));
+      pinchDist = d;
+    }
+  });
+  cv.addEventListener("pointerup", e => {
+    const wasSingle = pointers.size === 1;
+    pointers.delete(e.pointerId);
+    if (wasSingle && moved < 6) pick(e.clientX, e.clientY);
+  });
+  cv.addEventListener("pointercancel", e => pointers.delete(e.pointerId));
+  cv.addEventListener("wheel", e => {
+    e.preventDefault();
+    radius = Math.max(3.5, Math.min(18, radius * (1 + Math.sign(e.deltaY) * 0.08)));
+  }, { passive: false });
+
+  // ---------- rendering ----------
+  let W = 1, H = 1, dpr = 1;
+  function resize() {
+    dpr = Math.min(window.devicePixelRatio || 1, 2);
+    W = Math.max(1, wrap.clientWidth);
+    H = Math.max(1, wrap.clientHeight);
+    cv.width = Math.round(W * dpr);
+    cv.height = Math.round(H * dpr);
+  }
+  window.addEventListener("resize", resize);
+  new ResizeObserver(resize).observe(wrap);
+  resize();
+
+  const LIGHT = norm([0.4, 0.9, 0.5]);
+  let drawn = [];
+
+  function render() {
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.fillStyle = "#0e141b";
+    ctx.fillRect(0, 0, W, H);
+
+    // camera
+    const cp = [
+      target[0] + radius * Math.sin(phi) * Math.sin(theta),
+      target[1] + radius * Math.cos(phi),
+      target[2] + radius * Math.sin(phi) * Math.cos(theta)
+    ];
+    const fwd = norm(sub(target, cp));
+    const right = norm(cross(fwd, [0, 1, 0]));
+    const up = cross(right, fwd);
+    const f = 1.6 * Math.min(W, H);
+
+    const proj = p => {
+      const d = sub(p, cp);
+      const z = dot(d, fwd);
+      return [W/2 + f * dot(d, right) / z, H/2 - f * dot(d, up) / z, z];
+    };
+
+    // floor grid
+    ctx.lineWidth = 1;
+    ctx.strokeStyle = "#1f2b38";
+    ctx.beginPath();
+    for (let k = -5; k <= 5; k++) {
+      for (let s = -5; s < 5; s++) {
+        const segs = [[[k, -0.55, s], [k, -0.55, s+1]], [[s, -0.55, k], [s+1, -0.55, k]]];
+        segs.forEach(sg => {
+          const a = proj(sg[0]), b = proj(sg[1]);
+          if (a[2] > 0.3 && b[2] > 0.3) { ctx.moveTo(a[0], a[1]); ctx.lineTo(b[0], b[1]); }
+        });
+      }
+    }
+    ctx.stroke();
+
+    // faces
+    const items = [];
+    const sel = selected;
+    for (const fc of faces) {
+      const ex = mul(parts[fc.part].explode, explodeNow);
+      const world = fc.v.map(p => {
+        let q = p;
+        if (fc.spin) {
+          const a = spinAngle * fc.spin.dir, c = Math.cos(a), s = Math.sin(a);
+          const dx = q[0] - fc.spin.cx, dz = q[2] - fc.spin.cz;
+          q = [fc.spin.cx + dx*c + dz*s, q[1], fc.spin.cz - dx*s + dz*c];
+        }
+        return add(q, ex);
+      });
+      const pr = world.map(proj);
+      if (pr.some(p => p[2] < 0.3)) continue;
+
+      let n = norm(cross(sub(world[1], world[0]), sub(world[2], world[0])));
+      const cen = mul(world.reduce(add), 1 / world.length);
+      if (dot(n, sub(cp, cen)) < 0) n = mul(n, -1);
+
+      let k = fc.glow ? 1 : 0.35 + 0.65 * Math.max(0, dot(n, LIGHT));
+      let col = fc.color.map(v => v * k);
+      if (sel === fc.part) col = col.map((v, i) => v * 0.55 + [51, 102, 255][i] * 0.6);
+      const depth = pr.reduce((s, p) => s + p[2], 0) / pr.length;
+      items.push({ pr, depth, part: fc.part, alpha: fc.alpha,
+        css: "rgb(" + col.map(v => Math.min(255, Math.round(v))).join(",") + ")" });
+    }
+    items.sort((a, b) => b.depth - a.depth);
+
+    for (const it of items) {
+      ctx.globalAlpha = it.alpha;
+      ctx.fillStyle = it.css;
+      ctx.strokeStyle = it.css;
+      ctx.lineWidth = 0.8;
+      ctx.beginPath();
+      ctx.moveTo(it.pr[0][0], it.pr[0][1]);
+      for (let i = 1; i < it.pr.length; i++) ctx.lineTo(it.pr[i][0], it.pr[i][1]);
+      ctx.closePath();
+      ctx.fill();
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+    drawn = items;
+
+    // label for selected part
+    if (sel) {
+      const mine = items.filter(i => i.part === sel);
+      if (mine.length) {
+        let x = 0, y = 0;
+        mine.forEach(i => { x += i.pr[0][0]; y += i.pr[0][1]; });
+        x /= mine.length; y /= mine.length;
+        const label = parts[sel].name;
+        ctx.font = "600 13px system-ui, sans-serif";
+        const tw = ctx.measureText(label).width + 16;
+        const lx = Math.min(Math.max(x - tw/2, 6), W - tw - 6);
+        const ly = Math.max(y - 46, 8);
+        ctx.strokeStyle = "#4d8dff"; ctx.lineWidth = 1.5;
+        ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(lx + tw/2, ly + 24); ctx.stroke();
+        ctx.fillStyle = "#4d8dff";
+        ctx.beginPath(); ctx.arc(x, y, 3.5, 0, Math.PI*2); ctx.fill();
+        ctx.fillRect(lx, ly, tw, 24);
+        ctx.fillStyle = "#fff";
+        ctx.fillText(label, lx + 8, ly + 16);
+      }
+    }
+  }
+
+  function inside(pt, poly) {
+    let c = false;
+    for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+      const a = poly[i], b = poly[j];
+      if ((a[1] > pt[1]) !== (b[1] > pt[1]) &&
+          pt[0] < (b[0] - a[0]) * (pt[1] - a[1]) / (b[1] - a[1]) + a[0]) c = !c;
+    }
+    return c;
+  }
+
+  function pick(cx, cy) {
+    const r = cv.getBoundingClientRect();
+    const pt = [cx - r.left, cy - r.top];
+    for (let i = drawn.length - 1; i >= 0; i--) {
+      if (drawn[i].alpha < 1 && drawn[i].part !== "props") continue;
+      if (inside(pt, drawn[i].pr)) { select(drawn[i].part); return; }
+    }
+    select(null);
+  }
+
+  if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+    autoRotate = false; setToggle(rotBtn, false, "Auto-rotate");
+  }
+
+  let last = performance.now();
+  function loop(now) {
+    const dt = Math.min((now - last) / 1000, 0.05);
+    last = now;
+    if (autoRotate) theta += dt * 0.35;
+    if (spin) spinAngle += dt * 22;
+    explodeNow += (explodeTarget - explodeNow) * Math.min(1, dt * 8);
+    render();
+    requestAnimationFrame(loop);
+  }
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
